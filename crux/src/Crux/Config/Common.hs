@@ -77,6 +77,9 @@ data CruxOptions = CruxOptions
     -- ^ Should the MC-SAT Yices solver be enabled (disables unsat cores; default: no)
   , floatMode                :: String
     -- ^ Tells the solver which representation to use for floating point values.
+
+  , svcompMode               :: Bool
+    -- ^ If true, interpret the input files as benchmark sets, and behave as a SV-COMP solver
   }
 
 
@@ -91,11 +94,13 @@ cruxOptions = Config
             section "output-directory" dirSpec ""
             "Save results in this directory."
 
+          svcompMode <-
+            section "sv-comp" yesOrNoSpec False
+            "Behave like a SV-COMP solver"
 
           checkPathSat <-
             section "path-sat" yesOrNoSpec False
             "Enable path satisfiability checking (default: no)."
-
 
           profileCrucibleFunctions <-
             section "profile-crucible" yesOrNoSpec False
@@ -132,7 +137,6 @@ cruxOptions = Config
           makeCexes <-
             section "make-executables" yesOrNoSpec True
             "Should we generate counter-example executables. (default: yes)"
-
 
           solver <-
             section "solver" stringSpec "yices"
@@ -179,6 +183,10 @@ cruxOptions = Config
       , Option [] ["profile-solver"]
         "Enable profiling of solver events"
         $ NoArg $ \opts -> Right opts { profileSolver = True }
+
+      , Option "" ["sv-comp"]
+        "Behave like an SV-COMP solver"
+        $ NoArg $ \opts -> Right opts { svcompMode = True }
 
       , Option "t" ["timeout"]
         "Stop executing the simulator after this many seconds (default: 60)"
