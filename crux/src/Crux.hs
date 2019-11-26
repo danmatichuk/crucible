@@ -5,6 +5,7 @@ module Crux
   , mainWithOutputConfig
   , runSimulator
   , CruxOptions(..)
+  , loadOptions
   , module Crux.Extension
   , module Crux.Config
   , module Crux.Log
@@ -14,6 +15,7 @@ import Data.Text (Text)
 import qualified Data.Text as Text
 import Data.IORef
 import Data.List(intercalate)
+import Data.Maybe (fromMaybe)
 import qualified Data.Sequence as Seq
 import Control.Exception(catch, displayException)
 import Control.Monad(when)
@@ -107,7 +109,7 @@ showVersion l = outputLn ("crux version: " ++ Crux.version ++ ", " ++
 
 -- Run a computation in the context of a given online solver
 -- with a particular floating-point interpretation mode.
-withBackend ::
+withBackend :: forall scope a.
   CruxOptions ->
   NonceGenerator IO scope ->
   (forall solver fs.
@@ -130,6 +132,7 @@ withBackend cruxOpts nonceGen f =
   where
   unsatCores | yicesMCSat cruxOpts = NoUnsatFeatures
              | otherwise           = ProduceUnsatCores
+
   withSolver fpMode "cvc4" =
     withCVC4OnlineBackend fpMode nonceGen ProduceUnsatCores f
   withSolver fpMode "yices" =
@@ -211,6 +214,34 @@ execFeatureMaybe mb m =
     Just a  -> (:[]) <$> m a
 
 
+prepareExecutionFeatures ::
+  ( OnlineSolver scope solver
+  , IsInterpretedFloatExprBuilder (OnlineBackend scope solver fs)
+  ) =>
+  OnlineBackend scope solver fs ->
+  CruxOptions ->
+  IO (Maybe (ProfData (OnlineBackend scope solver fs)), [ GenericExecutionFeature (OnlineBackend scope solver fs) ])
+prepareExecutionFeatures sym cruxOpts =
+  do -- Setup profiling
+     let profiling = profileCrucibleFunctions cruxOpts || profileSolver cruxOpts
+     profInfo <- if profiling then Just <$> setupProfiling sym cruxOpts
+                              else pure Nothing
+     -- Global timeout
+     tfs <- execFeatureMaybe (globalTimeout cruxOpts) timeoutFeature
+
+     -- Loop bound
+     bfs <- execFeatureMaybe (loopBound cruxOpts) $ \i ->
+             boundedExecFeature (\_ -> return (Just i)) False {- side cond: no -}
+
+     -- Recursion bound
+     rfs <- execFeatureMaybe (recursionBound cruxOpts) $ \i ->
+             boundedRecursionFeature (\_ -> return (Just i)) False {- side cond: no -}
+
+     -- Check path satisfiability
+     psat_fs <- execFeatureIf (checkPathSat cruxOpts)
+              $ pathSatisfiabilityFeature sym (considerSatisfiability sym)
+
+     return (profInfo, tfs ++ profExecFeatures (fromMaybe noProfiling profInfo) ++ bfs ++ rfs ++ psat_fs)
 
 
 runSimulator ::
@@ -232,35 +263,17 @@ runSimulator lang opts@(cruxOpts,_) =
      -- XXX: add an option for this
      symCfg sym solverInteractionFile "crux-solver.out"
 
-     frm <- pushAssumptionFrame sym
 
      createDirectoryIfMissing True (outDir cruxOpts)
 
-     -- Setup profiling
-     let profiling = profileCrucibleFunctions cruxOpts || profileSolver cruxOpts
-     profInfo <- if profiling then setupProfiling sym cruxOpts
-                              else pure noProfiling
+     (profInfo, execFeatures) <- prepareExecutionFeatures sym cruxOpts
+     let mpi = fromMaybe noProfiling profInfo
 
-     -- Global timeout
-     tfs <- execFeatureMaybe (globalTimeout cruxOpts) timeoutFeature
-
-     -- Loop bound
-     bfs <- execFeatureMaybe (loopBound cruxOpts) $ \i ->
-             boundedExecFeature (\_ -> return (Just i)) False {- side cond: no -}
-
-     -- Recursion bound
-     rfs <- execFeatureMaybe (recursionBound cruxOpts) $ \i ->
-             boundedRecursionFeature (\_ -> return (Just i)) False {- side cond: no -}
-
-     -- Check path satisfiability
-     psat_fs <- execFeatureIf (checkPathSat cruxOpts)
-              $ pathSatisfiabilityFeature sym (considerSatisfiability sym)
-
-     let execFeatures = tfs ++ profExecFeatures profInfo ++ bfs ++ rfs ++ psat_fs
+     frm <- pushAssumptionFrame sym
 
      -- Ready to go!
      gls <- newIORef Seq.empty
-     inFrame profInfo "<Crux>" $
+     inFrame mpi "<Crux>" $
        simulate lang execFeatures opts sym emptyModel $ \(Result res) ->
         do case res of
              TimeoutResult _ ->
@@ -272,7 +285,7 @@ runSimulator lang opts@(cruxOpts,_) =
 
            let ctx' = execResultContext res
 
-           inFrame profInfo "<Prove Goals>" $
+           inFrame mpi "<Prove Goals>" $
              do todo <- getProofObligations sym
                 proved <- proveGoals cruxOpts ctx' todo
                 mgt <- provedGoalsTree ctx' proved
@@ -283,7 +296,6 @@ runSimulator lang opts@(cruxOpts,_) =
      when (simVerbose cruxOpts > 1) $
        say "Crux" "Simulation complete."
 
-     when profiling $
-       writeProf profInfo
+     maybe (return ()) writeProf profInfo
 
      readIORef gls
